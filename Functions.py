@@ -6,9 +6,11 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 from scipy import stats
-from scipy.stats import pearsonr, truncnorm
+from scipy.stats import truncnorm
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.cluster import AgglomerativeClustering
+from scipy.cluster.hierarchy import dendrogram
 
 
 def dis_to_label(dis):
@@ -898,3 +900,487 @@ def mediation_support_stability(ab_list, threshold):
         stability = 1.0
 
     return stability, jaccard_matrix
+
+
+def _leaf_order_from_children(children: np.ndarray, n_leaves: int) -> np.ndarray:
+    """Return the leaf order from an agglomerative clustering tree.
+
+    Parameters
+    ----------
+    children : np.ndarray
+        Children array from `AgglomerativeClustering.children_` with shape
+        `(n_leaves - 1, 2)`.
+    n_leaves : int
+        Number of leaf nodes in the clustering tree.
+
+    Returns
+    -------
+    np.ndarray
+        Permutation of leaf indices obtained by a left-to-right depth-first
+        traversal.
+    """
+    root = n_leaves + children.shape[0] - 1
+    tree = {}
+
+    for i, (a, b) in enumerate(children):
+        node_id = n_leaves + i
+        tree[node_id] = (int(a), int(b))
+
+    order = []
+
+    def dfs(node: int):
+        """Traverse the tree depth-first and collect leaf nodes."""
+        if node < n_leaves:
+            order.append(node)
+            return
+
+        left, right = tree[node]
+        dfs(left)
+        dfs(right)
+
+    dfs(root)
+
+    return np.array(order, dtype=int)
+
+
+def agglom_leaf_permutations(
+    X: np.ndarray,
+    *,
+    metric: str = "euclidean",
+    linkage: str = "ward",
+    compute_distances: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute row and column leaf permutations by agglomerative clustering.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Input matrix.
+    metric : str, default="euclidean"
+        Distance metric used by `AgglomerativeClustering`.
+    linkage : str, default="ward"
+        Linkage criterion used by `AgglomerativeClustering`.
+    compute_distances : bool, default=False
+        Whether to compute distances between merged clusters.
+
+    Returns
+    -------
+    tuple
+        Tuple `(row_perm, col_perm, row_model, col_model)`, where `row_perm`
+        and `col_perm` are leaf-order permutations, and `row_model` and
+        `col_model` are the fitted clustering models.
+    """
+    X = np.asarray(X)
+
+    row_model = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=0.0,
+        metric=metric,
+        linkage=linkage,
+        compute_distances=compute_distances,
+    )
+    row_model.fit(X)
+    row_perm = _leaf_order_from_children(row_model.children_, X.shape[0])
+
+    col_model = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=0.5,
+        metric=metric,
+        linkage=linkage,
+        compute_distances=compute_distances,
+    )
+    col_model.fit(X.T)
+    col_perm = _leaf_order_from_children(col_model.children_, X.shape[1])
+
+    return row_perm, col_perm, row_model, col_model
+
+
+def sklearn_tree_to_linkage(model):
+    """Convert a fitted sklearn agglomerative tree to a SciPy linkage matrix.
+
+    Parameters
+    ----------
+    model : AgglomerativeClustering
+        Fitted sklearn agglomerative clustering model with `children_`,
+        `distances_`, and `n_leaves_` attributes.
+
+    Returns
+    -------
+    np.ndarray
+        SciPy-compatible linkage matrix with shape `(n_samples - 1, 4)`.
+    """
+    children = model.children_
+    distances = model.distances_
+    n_samples = model.n_leaves_
+
+    Z = np.zeros((children.shape[0], 4))
+    cluster_sizes = np.zeros(n_samples + children.shape[0])
+    cluster_sizes[:n_samples] = 1
+
+    for i, (left, right) in enumerate(children):
+        idx = n_samples + i
+        Z[i, 0] = left
+        Z[i, 1] = right
+        Z[i, 2] = distances[i]
+        Z[i, 3] = cluster_sizes[left] + cluster_sizes[right]
+        cluster_sizes[idx] = Z[i, 3]
+
+    return Z
+
+
+def plot_sklearn_dendrogram_with_leaf_ids(
+    model,
+    name,
+    *,
+    orientation="left",
+    figsize=(30, 5),
+    title="AgglomerativeClustering dendrogram",
+    show_leaf_ids=True,
+    leaf_font_size=8,
+    leaf_rotation=90,
+    truncate_mode=None,
+    p=30,
+):
+    """Plot a dendrogram from a fitted sklearn clustering model.
+
+    Parameters
+    ----------
+    model : AgglomerativeClustering
+        Fitted sklearn agglomerative clustering model.
+    name : str
+        Name suffix used in the saved output filename.
+    leaf_names : list[str], optional
+        Names to display at the leaves. If `None`, original leaf indices are used.
+    orientation : str, default="left"
+        Orientation of the dendrogram.
+    figsize : tuple, default=(30, 5)
+        Figure size.
+    title : str, default="AgglomerativeClustering dendrogram"
+        Dendrogram title.
+    show_leaf_ids : bool, default=True
+        Whether to display leaf labels.
+    leaf_font_size : int, default=8
+        Font size of leaf labels.
+    leaf_rotation : float, default=90
+        Rotation angle for leaf labels.
+    truncate_mode : str, optional
+        Truncation mode passed to `scipy.cluster.hierarchy.dendrogram`.
+    p : int, default=30
+        Truncation parameter used when `truncate_mode` is not `None`.
+
+    Returns
+    -------
+    np.ndarray
+        Linkage matrix used to generate the dendrogram.
+    """
+    children = model.children_
+    n_samples = model.n_leaves_
+
+    Z = np.zeros((children.shape[0], 4))
+    sizes = np.zeros(n_samples + children.shape[0])
+    sizes[:n_samples] = 1
+
+    for i, (a, b) in enumerate(children):
+        Z[i, 0] = a
+        Z[i, 1] = b
+        Z[i, 2] = i + 2
+        Z[i, 3] = sizes[a] + sizes[b]
+        sizes[n_samples + i] = Z[i, 3]
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    dendrogram(
+        Z,
+        ax=ax,
+        orientation=orientation,
+        leaf_font_size=leaf_font_size,
+        leaf_rotation=leaf_rotation,
+        truncate_mode=truncate_mode,
+        p=p,
+        color_threshold=2,
+        above_threshold_color="black",
+        link_color_func=lambda k: "black",
+    )
+
+    ax.set_title("")
+    ax.set_xticks([])
+
+    if orientation in ["bottom", "top"]:
+        ax.set_yticks([])
+        for label in ax.get_xticklabels():
+            label.set_rotation(leaf_rotation)
+            label.set_fontsize(leaf_font_size)
+            label.set_ha("right")
+    else:
+        ax.set_xticks([])
+        for label in ax.get_yticklabels():
+            label.set_rotation(leaf_rotation)
+            label.set_fontsize(leaf_font_size)
+            label.set_va("center")
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    fig.tight_layout()
+    plt.show()
+
+
+def top_km_abs_sum_submatrix(A: np.ndarray, k: int, m: int, g=False) -> np.ndarray:
+    """Extract a submatrix using rows and columns with largest absolute sums.
+
+    Parameters
+    ----------
+    A : np.ndarray
+        Input matrix.
+    k : int
+        Number of rows to select.
+    m : int
+        Number of columns to select.
+    g : bool, default=False
+        If `True`, return the selected row and column indices instead of the
+        submatrix.
+
+    Returns
+    -------
+    np.ndarray or tuple[np.ndarray, np.ndarray]
+        Selected submatrix if `g=False`; otherwise, selected row and column
+        indices.
+    """
+    A = np.asarray(A)
+
+    row_scores = np.sum(np.abs(A), axis=1)
+    col_scores = np.sum(np.abs(A), axis=0)
+
+    row_idx = np.argsort(row_scores)[-k:]
+    col_idx = np.argsort(col_scores)[-m:]
+
+    if g:
+        return row_idx, col_idx
+
+    return A[np.ix_(row_idx, col_idx)]
+
+def zero_smallest_25_percent(x, q=25):
+    """Set entries with small absolute values to zero.
+
+    Entries whose absolute values are less than or equal to the `q`-th
+    percentile of `abs(x)` are replaced by zero.
+
+    Parameters
+    ----------
+    x : array-like
+        Input array.
+    q : float, default=25
+        Percentile threshold applied to the absolute values.
+
+    Returns
+    -------
+    np.ndarray
+        Array with small-magnitude entries set to zero.
+    """
+    x = np.asarray(x, dtype=float)
+    thresh = np.percentile(np.abs(x), q)
+
+    x_out = x.copy()
+    x_out[np.abs(x_out) <= thresh] = 0.0
+
+    return x_out
+
+
+def top_k_abs_cells(A: np.ndarray, k: int = 10):
+    """Return the top-k entries with largest absolute values.
+
+    Parameters
+    ----------
+    A : np.ndarray
+        Input matrix.
+    k : int, default=10
+        Number of entries to return.
+
+    Returns
+    -------
+    list[tuple[int, int, float]]
+        List of `(row, column, value)` tuples sorted by decreasing absolute
+        value.
+    """
+    A = np.asarray(A)
+
+    flat_idx = np.argsort(np.abs(A), axis=None)[-k:]
+    rows, cols = np.unravel_index(flat_idx, A.shape)
+
+    values = A[rows, cols]
+    order = np.argsort(-np.abs(values))
+
+    return list(zip(rows[order], cols[order], values[order]))
+
+def plot_feature_importance_quantile(gene, label="MMSE", method=None):
+    """Plot feature-importance quantile counts by hemisphere and brain network.
+
+    The function loads feature-importance values, assigns each feature to an
+    importance quantile, extracts hemisphere and network labels from feature
+    names, and plots grouped bar charts separately for the left and right
+    hemispheres.
+
+    Parameters
+    ----------
+    gene : str
+        Gene identifier. Currently unused because the function loads the
+        full-beta file.
+    label : str, default="MMSE"
+        Outcome label used to select the feature-importance file.
+    method : object, optional
+        Unused parameter kept for API compatibility.
+    """
+    file_path = f"Brain_Hist/FullBeta_{label}.csv"
+    df = pd.read_csv(file_path)
+
+    df["quantile"] = pd.qcut(df["importance"].abs(), 4, labels=False)
+    df["hemisphere"] = df["feature"].apply(lambda x: x.split("_")[0])
+    df["network"] = df["feature"].apply(lambda x: x.split("_")[1])
+
+    network_mapping = {
+        "Vis": "Visual",
+        "SomMot": "SomMot",
+        "DorsAttn": "Dorsal",
+        "SalVentAttn": "Ventral",
+        "Limbic": "Limbic",
+        "Cont": "Control",
+        "Default": "Default",
+    }
+    ordered_networks = [
+        "Visual",
+        "SomMot",
+        "Dorsal",
+        "Ventral",
+        "Limbic",
+        "Control",
+        "Default",
+    ]
+
+    df["network"] = df["network"].map(network_mapping)
+    df = df[df["quantile"] != 1]
+
+    quantile_counts = (
+        df.groupby(["hemisphere", "network", "quantile"])
+        .size()
+        .unstack(fill_value=0)
+    )
+    quantile_counts = quantile_counts.reindex(ordered_networks, level="network")
+
+    left_counts = quantile_counts.loc["LH"]
+    right_counts = quantile_counts.loc["RH"]
+
+    left_colors = ["#fddbc7", "#ef8a62", "#b2182b"]
+    right_colors = ["#d1e5f0", "#67a9cf", "#2166ac"]
+
+    w = 8
+    fig, axes = plt.subplots(
+        nrows=1,
+        ncols=2,
+        figsize=(w, w * 1.9 / 6),
+        sharey=True,
+    )
+
+    bar_width = 0.25
+    x_left = np.arange(len(left_counts.index))
+    x_right = np.arange(len(right_counts.index))
+
+    for i, quantile in enumerate(left_counts.columns):
+        axes[0].bar(
+            x_left + i * bar_width,
+            left_counts[quantile],
+            width=bar_width,
+            color=left_colors[i],
+            edgecolor="black",
+            linewidth=1,
+        )
+
+    axes[0].set_xticks(x_left + bar_width * (len(left_counts.columns) / 2 - 0.5))
+    axes[0].set_xticklabels(left_counts.index, rotation=45, ha="right")
+    axes[0].spines["right"].set_visible(False)
+    axes[0].spines["top"].set_visible(False)
+    axes[0].set_ylim(0, 16.5)
+    axes[0].set_yticks([0, 5, 10, 15])
+
+    for i, quantile in enumerate(right_counts.columns):
+        axes[1].bar(
+            x_right + i * bar_width,
+            right_counts[quantile],
+            width=bar_width,
+            color=right_colors[i],
+            edgecolor="black",
+            linewidth=1,
+        )
+
+    axes[1].set_xticks(x_right + bar_width * (len(right_counts.columns) / 2 - 0.5))
+    axes[1].set_xticklabels(right_counts.index, rotation=45, ha="right")
+    axes[1].spines["right"].set_visible(False)
+    axes[1].spines["top"].set_visible(False)
+
+    for ax in axes:
+        ax.legend().set_visible(False)
+        ax.set_title("")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    plt.tight_layout()
+    plt.show()
+
+def save_feature_importance_csv(f: np.ndarray, i: np.ndarray, path: str):
+    """Save feature-importance pairs to a CSV file.
+
+    Parameters
+    ----------
+    f : np.ndarray
+        Feature names.
+    i : np.ndarray
+        Feature-importance values.
+    path : str
+        Output path for the saved CSV file.
+
+    Raises
+    ------
+    AssertionError
+        If `f` and `i` do not have the same length.
+    """
+    f = np.asarray(f)
+    i = np.asarray(i)
+
+    assert len(f) == len(i), "f and i must have the same length"
+
+    df = pd.DataFrame(
+        {
+            "feature": f,
+            "importance": i,
+        }
+    )
+
+    df.to_csv(path, index=False)
+
+def topk_abs_mask(a, k=20):
+    """Return a row-wise mask for the top-k largest absolute values.
+
+    For each row of `a`, this function marks the entries with the top-k
+    largest absolute values as `True` and all other entries as `False`.
+
+    Parameters
+    ----------
+    a : np.ndarray
+        Input matrix.
+    k : int, default=20
+        Number of entries to keep per row.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask with the same shape as `a`.
+    """
+    n_rows, n_cols = a.shape
+    k_eff = min(k, n_cols)
+
+    idx_topk = np.argpartition(np.abs(a), n_cols - k_eff, axis=1)[:, -k_eff:]
+
+    mask = np.zeros_like(a, dtype=bool)
+    rows = np.arange(n_rows)[:, None]
+    mask[rows, idx_topk] = True
+
+    return mask
